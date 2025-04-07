@@ -3,12 +3,24 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageChops, ImageEnhance
 import node_helpers
 import torch
+import comfy.model_management
+import comfy.samplers
+import comfy.sample
+import comfy.utils
+import latent_preview
+from typing import Any, List, Tuple, Optional, Union, Dict
 
 def pil2tensor(image: Image) -> torch.Tensor:
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
 
 def tensor2pil(t_image: torch.Tensor) -> Image:
     return Image.fromarray(np.clip(255.0 * t_image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+    
+def apply_gaussian_blur(image_np, ksize=5, sigmaX=1.0):
+    if ksize % 2 == 0:
+        ksize += 1  # ksize must be odd
+    blurred_image = cv2.GaussianBlur(image_np, (ksize, ksize), sigmaX=sigmaX)
+    return blurred_image
 
 def apply_gaussian_blur(image_np, ksize=5, sigmaX=1.0):
     if ksize % 2 == 0:
@@ -90,7 +102,7 @@ class TTP_Image_Tile_Batch:
         img_width, img_height = image.size
 
         if img_width <= tile_width and img_height <= tile_height:
-            return ([pil2tensor(image).unsqueeze(0)], [(0, 0, img_width, img_height)], (img_width, img_height), (1, 1))
+            return (pil2tensor(image), [(0, 0, img_width, img_height)], (img_width, img_height), (1, 1))
 
         def calculate_step(size, tile_size):
             if size <= tile_size:
@@ -466,26 +478,37 @@ class Tile_imageSize:
     def image_width_height(self, image, width_factor, height_factor, overlap_rate):
         _, raw_H, raw_W, _ = image.shape
         if overlap_rate == 0:
-            tile_width = int(raw_W / width_factor)
-            tile_height = int(raw_H / height_factor)
-            # 验证 tile_width 和 tile_height 是否可以被8整除
-            if tile_width % 8 != 0:
-                tile_width = ((tile_width + 7) // 8) * 8
-            if tile_height % 8 != 0:
-                tile_height = ((tile_height + 7) // 8) * 8
-        
+            # 水平方向
+            if width_factor == 1:
+                tile_width = raw_W
+            else:
+                tile_width = int(raw_W / width_factor)
+                if tile_width % 8 != 0:
+                    tile_width = ((tile_width + 7) // 8) * 8
+            # 垂直方向
+            if height_factor == 1:
+                tile_height = raw_H
+            else:
+                tile_height = int(raw_H / height_factor)
+                if tile_height % 8 != 0:
+                    tile_height = ((tile_height + 7) // 8) * 8
+
         else:
-            # 使用正确的公式计算 tile_width 和 tile_height
-            tile_width = int(raw_W / (1 + (width_factor - 1) * (1 - overlap_rate)))
-            tile_height = int(raw_H / (1 + (height_factor - 1) * (1 - overlap_rate)))
+            # 水平方向
+            if width_factor == 1:
+                tile_width = raw_W
+            else:
+                tile_width = int(raw_W / (1 + (width_factor - 1) * (1 - overlap_rate)))
+                if tile_width % 8 != 0:
+                    tile_width = (tile_width // 8) * 8
+            # 垂直方向
+            if height_factor == 1:
+                tile_height = raw_H
+            else:
+                tile_height = int(raw_H / (1 + (height_factor - 1) * (1 - overlap_rate)))
+                if tile_height % 8 != 0:
+                    tile_height = (tile_height // 8) * 8
 
-            # 验证 tile_width 和 tile_height 是否可以被8整除
-            if tile_width % 8 != 0:
-                tile_width = (tile_width // 8) * 8
-            if tile_height % 8 != 0:
-                tile_height = (tile_height // 8) * 8
-
-        # 返回结果
         return (tile_width, tile_height)
         
 class TTP_Expand_And_Mask:
@@ -496,7 +519,7 @@ class TTP_Expand_And_Mask:
     1. 支持同时在多个方向上扩展图像。
     2. 分别控制每个方向的扩展块数量。
     3. 将输入图像的透明通道（Alpha 通道）信息转换为蒙版，并与新创建的蒙版合并。
-    4. 添加一个布尔参数 fill_alpha_decision 来决定是否将输出图片中的透明区域填充为白色，并输出 RGB 图像。
+    4. 添加一个布尔参数 fill_alpha_decision 来决定是否将输出图片中的透明区域填充为指定颜色，并输出 RGB 图像。
     """
     def __init__(self, *args, **kwargs):
         pass
@@ -508,9 +531,8 @@ class TTP_Expand_And_Mask:
             "required": {
                 "image": ("IMAGE",),  # 输入一张图片
                 "fill_mode": (["duplicate", "white"], {"default": "duplicate", "label": "Fill Mode"}),
-                # fill_mode是一个字符串列表参数，可以选择"duplicate"或"white"
-                "fill_alpha_decision": ("BOOLEAN", {"default": False, "label": "Fill Alpha with White"}),
-                # fill_alpha_decision为一个布尔值参数，用来决定是否将输出图像透明区域填充为白色
+                "fill_alpha_decision": ("BOOLEAN", {"default": False, "label": "Fill Alpha with Color"}),
+                "fill_color": ("STRING", {"default": "#7F7F7F", "label": "Fill Color"}),
             },
             "optional": {
                 **{f"expand_{dir}": ("BOOLEAN", {"default": False, "label": f"Expand {dir.capitalize()}"}) for dir in directions},
@@ -523,7 +545,26 @@ class TTP_Expand_And_Mask:
     FUNCTION = "expand_and_mask"
     CATEGORY = "TTP/Image"
 
-    def expand_and_mask(self, image, fill_mode="duplicate", fill_alpha_decision=False, **kwargs):
+    def hex_to_rgba(self, hex_color):
+        # 去除可能存在的 '#' 字符
+        hex_color = hex_color.lstrip('#')
+        # 如果为6位十六进制字符串，默认为不透明
+        if len(hex_color) == 6:
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            return (r, g, b, 255)
+        # 如果为8位，则最后两位为透明度
+        elif len(hex_color) == 8:
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            a = int(hex_color[6:8], 16)
+            return (r, g, b, a)
+        else:
+            raise ValueError("Invalid hex color format")
+
+    def expand_and_mask(self, image, fill_mode="duplicate", fill_alpha_decision=False, fill_color="#7F7F7F", **kwargs):
         pil_image = tensor2pil(image)
         orig_width, orig_height = pil_image.size
         has_alpha = (pil_image.mode == 'RGBA')
@@ -662,10 +703,12 @@ class TTP_Expand_And_Mask:
         # 创建蒙版张量 (1, 1, height, width)
         mask_tensor = torch.from_numpy(mask_array).unsqueeze(0).unsqueeze(0)
 
-        # 根据 fill_alpha_decision 参数决定是否将输出图像中的透明区域填充为白色
+        # 根据 fill_alpha_decision 参数决定是否将输出图像中的透明区域填充为指定颜色
         if fill_alpha_decision and has_alpha:
             expanded_image = expanded_image.convert('RGBA')  # 确保图像是RGBA模式
-            background = Image.new('RGBA', expanded_image.size, (255, 255, 255, 255)) 
+            # 使用自定义填充颜色代替纯白色
+            fill_rgba = self.hex_to_rgba(fill_color)
+            background = Image.new('RGBA', expanded_image.size, fill_rgba)
             expanded_image = Image.alpha_composite(background, expanded_image)
             expanded_image = expanded_image.convert('RGB')  # 转换为RGB模式
             expanded_image_mode = 'RGB'
@@ -699,7 +742,369 @@ class TTP_text_mix:
         final_text = template.replace("{text1}", text1).replace("{text2}", text2).replace("{text3}", text3)
 
         return (text1, text2, text3, final_text)
+
+def horner_poly(x: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+    """
+    使用 Horner's scheme 计算多项式:
+      c[0]*x^(n-1) + c[1]*x^(n-2) + ... + c[n-2]*x + c[n-1]
+    其中 coefficients = [c[0], c[1], ..., c[n-1]].
+    """
+    out = torch.zeros_like(x)
+    for c in coefficients:
+        out = out * x + c
+    return out
+
+def modulate(x, shift, scale):
+    """Modulate layer implementation for HunyuanVideo"""
+    try:
+        # Ensure consistent data types
+        shift = shift.to(dtype=x.dtype, device=x.device)
+        scale = scale.to(dtype=x.dtype, device=x.device)
         
+        # Reshape shift and scale to match x dimensions
+        B = x.shape[0]  # batch size
+        
+        if len(x.shape) == 3:  # [B, L, D]
+            shift = shift.view(B, 1, -1)  # [B, 1, D]
+            scale = scale.view(B, 1, -1)  # [B, 1, D]
+            shift = shift.expand(-1, x.shape[1], -1)  # [B, L, D]
+            scale = scale.expand(-1, x.shape[1], -1)  # [B, L, D]
+        elif len(x.shape) == 5:  # [B, C, T, H, W]
+            shift = shift.view(B, -1, 1, 1, 1)  # [B, C, 1, 1, 1]
+            scale = scale.view(B, -1, 1, 1, 1)  # [B, C, 1, 1, 1]
+            shift = shift.expand(-1, -1, x.shape[2], x.shape[3], x.shape[4])  # [B, C, T, H, W]
+            scale = scale.expand(-1, -1, x.shape[2], x.shape[3], x.shape[4])  # [B, C, T, H, W]
+        else:
+            raise ValueError(f"Unsupported input shape: {x.shape}")
+        
+        # Step-by-step calculation to reduce memory usage
+        result = x.mul_(1 + scale)  # in-place operation
+        result.add_(shift)  # in-place operation
+        
+        return result
+        
+    except Exception as e:
+        raise RuntimeError(f"Modulation failed: {str(e)}")
+
+def modulate(x, shift, scale):
+    """Modulate layer implementation for HunyuanVideo"""
+    try:
+        # Ensure consistent data types
+        shift = shift.to(dtype=x.dtype, device=x.device)
+        scale = scale.to(dtype=x.dtype, device=x.device)
+        
+        # Reshape shift and scale to match x dimensions
+        B = x.shape[0]  # batch size
+        
+        if len(x.shape) == 3:  # [B, L, D]
+            shift = shift.view(B, 1, -1)  # [B, 1, D]
+            scale = scale.view(B, 1, -1)  # [B, 1, D]
+            shift = shift.expand(-1, x.shape[1], -1)  # [B, L, D]
+            scale = scale.expand(-1, x.shape[1], -1)  # [B, L, D]
+        elif len(x.shape) == 5:  # [B, C, T, H, W]
+            shift = shift.view(B, -1, 1, 1, 1)  # [B, C, 1, 1, 1]
+            scale = scale.view(B, -1, 1, 1, 1)  # [B, C, 1, 1, 1]
+            shift = shift.expand(-1, -1, x.shape[2], x.shape[3], x.shape[4])  # [B, C, T, H, W]
+            scale = scale.expand(-1, -1, x.shape[2], x.shape[3], x.shape[4])  # [B, C, T, H, W]
+        else:
+            raise ValueError(f"Unsupported input shape: {x.shape}")
+        
+        # Step-by-step calculation to reduce memory usage
+        result = x.mul_(1 + scale)  # in-place operation
+        result.add_(shift)  # in-place operation
+        
+        return result
+        
+    except Exception as e:
+        raise RuntimeError(f"Modulation failed: {str(e)}")
+
+class TeaCacheHunyuanVideoSampler:
+    @classmethod 
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "noise": ("NOISE",),
+                "guider": ("GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+                "speedup": ([
+                    "Original (1x)", 
+                    "Fast (1.6x)", 
+                    "Faster (2.1x)",
+                    "Ultra Fast (3.2x)",
+                    "Shapeless Fast (4.4x)"
+                ], {
+                    "default": "Fast (1.6x)",
+                    "tooltip": (
+                        "Control TeaCache speed/quality trade-off:\n"
+                        "Original: Base quality\n"
+                        "Fast: 1.6x speedup\n"
+                        "Faster: 2.1x speedup\n"
+                        "Ultra Fast: 3.2x speedup\n"
+                        "Shapeless Fast: 4.4x speedup"
+                    )
+                }),
+                "enable_custom_speed": ("BOOLEAN", {
+                    "default": False,
+                    "label": "Enable Custom Speed"
+                }),
+                "custom_speed": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 1.0,
+                    "max": 4.4,
+                    "step": 0.1,
+                    "label": "Custom Speed Multiplier"
+                })
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("output", "denoised_output")
+    FUNCTION = "sample"
+    CATEGORY = "sampling/custom_sampling"
+
+    def calculate_threshold(self, speed_multiplier: float) -> float:
+        """根据预设速度点进行线性插值，计算自定义速度对应的阈值"""
+        # 预设的速度倍数和对应阈值
+        predefined_speeds = [1.0, 1.6, 2.1, 3.2, 4.4]
+        predefined_thresholds = [0.0, 0.1, 0.15, 0.25, 0.35]
+        
+        # 使用 numpy 的线性插值函数
+        threshold = np.interp(speed_multiplier, predefined_speeds, predefined_thresholds)
+        
+        # 确保阈值不超过最大值
+        threshold = min(threshold, 0.35)
+        
+        return threshold
+
+    def teacache_forward(
+            self,
+            transformer,
+            x: torch.Tensor,
+            timestep: torch.Tensor,  # Should be in range(0, 1000).
+            context: Optional[torch.Tensor] = None,
+            y: Optional[torch.Tensor] = None,  # Text embedding for modulation.
+            guidance: Optional[torch.Tensor] = None,  # Guidance for modulation, should be cfg_scale x 1000.
+            attention_mask: Optional[torch.Tensor] = None,
+            control: Any = None,
+            transformer_options: Dict = {},
+            **kwargs
+        ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """TeaCache forward implementation"""
+        should_calc = True
+        
+        if transformer.enable_teacache:
+            try:
+                # 获取输入维度
+                B, C, T, H, W = x.shape
+                
+                # 准备调制向量
+                try:
+                    # HunyuanVideo 使用 timestep_embedding 进行时间步编码
+                    time_emb = comfy.ldm.flux.layers.timestep_embedding(timestep, 256, time_factor=1.0).to(x.dtype)
+                    vec = transformer.time_in(time_emb)  # [B, hidden_size]
+                    
+                    # 文本调制 - HunyuanVideo 使用 vector_in 处理 y 而不是 context
+                    if y is not None:
+                        if not hasattr(transformer, 'params') or not hasattr(transformer.params, 'vec_in_dim'):
+                            raise AttributeError("Transformer missing required attributes: params.vec_in_dim")
+                        vec = vec + transformer.vector_in(y[:, :transformer.params.vec_in_dim])
+                    
+                    # 指导调制
+                    if guidance is not None and getattr(transformer, 'params', None) and transformer.params.guidance_embed:
+                        guidance_emb = comfy.ldm.flux.layers.timestep_embedding(guidance, 256).to(x.dtype)
+                        guidance_vec = transformer.guidance_in(guidance_emb)
+                        vec = vec + guidance_vec
+                        
+                except Exception as e:
+                    raise RuntimeError(f"Failed to prepare modulation vector: {str(e)}")
+                
+                # 嵌入图像
+                try:
+                    img = transformer.img_in(x)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to embed image: {str(e)}")
+                
+                if transformer.enable_teacache:
+                    try:
+                        # 使用原地操作减少内存使用
+                        inp = img.clone()
+                        vec_ = vec.clone()
+                        
+                        # 获取调制参数
+                        modulation_output = transformer.double_blocks[0].img_mod(vec_)
+                        
+                        # 处理调制输出
+                        if isinstance(modulation_output, tuple):
+                            if len(modulation_output) >= 2:
+                                mod_shift = modulation_output[0]
+                                mod_scale = modulation_output[1]
+                                if hasattr(mod_shift, 'shift') and hasattr(mod_scale, 'scale'):
+                                    img_mod1_shift = mod_shift.shift
+                                    img_mod1_scale = mod_scale.scale
+                                else:
+                                    img_mod1_shift = mod_shift
+                                    img_mod1_scale = mod_scale
+                            else:
+                                raise ValueError(f"Tuple too short, expected at least 2 elements, got {len(modulation_output)}")
+                        elif hasattr(modulation_output, 'shift') and hasattr(modulation_output, 'scale'):
+                            img_mod1_shift = modulation_output.shift
+                            img_mod1_scale = modulation_output.scale
+                        elif hasattr(modulation_output, 'chunk'):
+                            chunks = modulation_output.chunk(6, dim=-1)
+                            img_mod1_shift = chunks[0]
+                            img_mod1_scale = chunks[1]
+                        else:
+                            raise ValueError(f"Unsupported modulation output format: {type(modulation_output)}")
+                        
+                        # 确保获取到的是张量
+                        if not isinstance(img_mod1_shift, torch.Tensor) or not isinstance(img_mod1_scale, torch.Tensor):
+                            raise ValueError(f"Failed to get tensor values for shift and scale")
+                        
+                        # 应用归一化和调制
+                        normed_inp = transformer.double_blocks[0].img_norm1(inp)
+                        del inp  # 释放内存
+                        
+                        modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
+                        del normed_inp  # 释放内存
+                        
+                        # 计算相对 L1 距离并决定是否需要计算
+                        if transformer.cnt == 0 or transformer.cnt == transformer.num_steps - 1:
+                            should_calc = True
+                            transformer.accumulated_rel_l1_distance = 0
+                        else:
+                            try:
+                                coefficients = [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
+                                rescale_func = np.poly1d(coefficients)
+                                rel_l1 = ((modulated_inp - transformer.previous_modulated_input).abs().mean() / 
+                                         (transformer.previous_modulated_input.abs().mean() + 1e-6)).cpu().item()
+                                transformer.accumulated_rel_l1_distance += rescale_func(rel_l1)
+                                
+                                if transformer.accumulated_rel_l1_distance < transformer.rel_l1_thresh:
+                                    should_calc = False
+                                else:
+                                    should_calc = True
+                                    transformer.accumulated_rel_l1_distance = 0
+                            except Exception as e:
+                                should_calc = True
+                        
+                        transformer.previous_modulated_input = modulated_inp
+                        transformer.cnt += 1
+                        
+                    except Exception as e:
+                        should_calc = True
+
+            except Exception as e:
+                should_calc = True
+
+        # 如果需要计算，调用原始的 forward 方法
+        if should_calc:
+            try:
+                out = transformer.original_forward(x, timestep, context, y, guidance, 
+                                                attention_mask=attention_mask,
+                                                control=control,
+                                                transformer_options=transformer_options,
+                                                **kwargs)
+                transformer.previous_residual = out
+                return out
+            except Exception as e:
+                raise
+        else:
+            # 如果不需要计算，返回之前的结果
+            return transformer.previous_residual
+
+    def sample(self, noise, guider, sampler, sigmas, latent_image, speedup, enable_custom_speed=False, custom_speed=1.0):
+        """Sampling implementation"""
+        device = comfy.model_management.get_torch_device()
+        
+        # 定义预设速度的阈值映射
+        predefined_speeds = [1.0, 1.6, 2.1, 3.2, 4.4]
+        predefined_thresholds = [0.0, 0.1, 0.15, 0.25, 0.35]
+        
+        # 根据是否启用自定义速度来决定使用哪个阈值
+        if enable_custom_speed:
+            if not (1.0 <= custom_speed <= 4.4):
+                raise ValueError("Custom speed must be between 1.0 and 4.4")
+            threshold = self.calculate_threshold(custom_speed)
+        else:
+            # 定义预设的速度选项
+            thresh_map = {
+                "Original (1x)": 0.0,
+                "Fast (1.6x)": 0.1,
+                "Faster (2.1x)": 0.15,
+                "Ultra Fast (3.2x)": 0.25,
+                "Shapeless Fast (4.4x)": 0.35
+            }
+            if speedup not in thresh_map:
+                raise ValueError(f"Unsupported speedup option: {speedup}")
+            threshold = thresh_map[speedup]
+        
+        try:
+            # 获取 transformer
+            transformer = guider.model_patcher.model.diffusion_model
+            
+            # 初始化 TeaCache 状态
+            transformer.enable_teacache = True
+            transformer.cnt = 0  
+            transformer.num_steps = len(sigmas) - 1
+            transformer.rel_l1_thresh = threshold
+            transformer.accumulated_rel_l1_distance = 0
+            transformer.previous_modulated_input = None
+            transformer.previous_residual = None
+
+            latent = latent_image
+            latent_image = latent["samples"].clone()
+            latent = latent.copy()
+
+            noise_mask = None
+            if "noise_mask" in latent:
+                noise_mask = latent["noise_mask"].clone()
+
+            # 保存原始 forward 方法
+            transformer.original_forward = transformer.forward
+            
+            # 使用 lambda 替换 forward 方法，确保正确绑定 self
+            transformer.forward = lambda x, t, context=None, y=None, guidance=None, attention_mask=None, control=None, transformer_options={}, **kwargs: self.teacache_forward(
+                transformer, x, t, context, y, guidance, attention_mask, control, transformer_options, **kwargs
+            )
+            
+            try:
+                x0_output = {}
+                callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+                
+                disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+                samples = guider.sample(
+                    noise.generate_noise(latent), 
+                    latent_image, 
+                    sampler, 
+                    sigmas, 
+                    denoise_mask=noise_mask, 
+                    callback=callback, 
+                    disable_pbar=disable_pbar, 
+                    seed=noise.seed
+                )
+                samples = samples.to(comfy.model_management.intermediate_device())
+                
+            finally:
+                # 恢复原始的 forward 方法
+                transformer.forward = transformer.original_forward
+                delattr(transformer, 'original_forward')
+                transformer.enable_teacache = False
+
+            out = latent.copy()
+            out["samples"] = samples
+            if "x0" in x0_output:
+                out_denoised = latent.copy()
+                out_denoised["samples"] = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
+            else:
+                out_denoised = out
+                
+            return (out, out_denoised)
+
+        except Exception as e:
+            raise RuntimeError(f"Sampling failed: {str(e)}")
+
 NODE_CLASS_MAPPINGS = {
     "TTPlanet_Tile_Preprocessor_Simple": TTPlanet_Tile_Preprocessor_Simple,
     "TTP_Image_Tile_Batch": TTP_Image_Tile_Batch,
@@ -710,18 +1115,20 @@ NODE_CLASS_MAPPINGS = {
     "TTP_Tile_image_size": Tile_imageSize,
     "TTP_condsetarea_merge_test": TTP_condsetarea_merge_test,
     "TTP_Expand_And_Mask": TTP_Expand_And_Mask,
-    "TTP_text_mix": TTP_text_mix
+    "TTP_text_mix": TTP_text_mix,
+    "TeaCacheHunyuanVideoSampler": TeaCacheHunyuanVideoSampler
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TTPlanet_Tile_Preprocessor_Simple": "�TTP Tile Preprocessor Simple",
-    "TTP_Image_Tile_Batch": "�TTP_Image_Tile_Batch",
-    "TTP_Image_Assy": "�TTP_Image_Assy",
-    "TTP_CoordinateSplitter": "�TTP_CoordinateSplitter",
-    "TTP_condtobatch": "�TTP_cond to batch",
-    "TTP_condsetarea_merge": "�TTP_condsetarea_merge",
-    "TTP_Tile_image_size": "�TTP_Tile_image_size",
+    "TTPlanet_Tile_Preprocessor_Simple": "TTP Tile Preprocessor Simple",
+    "TTP_Image_Tile_Batch": "TTP_Image_Tile_Batch",
+    "TTP_Image_Assy": "TTP_Image_Assy",
+    "TTP_CoordinateSplitter": "TTP_CoordinateSplitter",
+    "TTP_condtobatch": "TTP_cond to batch",
+    "TTP_condsetarea_merge": "TTP_condsetarea_merge",
+    "TTP_Tile_image_size": "TTP_Tile_image_size",
     "TTP_condsetarea_merge_test": "TTP_condsetarea_merge_test",
     "TTP_Expand_And_Mask": "TTP_Expand_And_Mask",
-    "TTP_text_mix": "TTP_text_mix"
+    "TTP_text_mix": "TTP_text_mix",
+    "TeaCacheHunyuanVideoSampler": "TTP_TeaCache HunyuanVideo Sampler"
 }

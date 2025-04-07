@@ -4,6 +4,30 @@ This workflow is designed for **simple logic amazing upscale nodes** in the **DI
 
 We hope you enjoy using it!
 
+## **What's New**
+
+### **TeaCache Sampler Integration for Hunyuan Video**
+
+Thanks to the contributions from the TeaCache code repository ([ali-vilab/TeaCache](https://github.com/ali-vilab/TeaCache)) and code references from [facok/ComfyUI-TeaCacheHunyuanVideo](https://github.com/facok/ComfyUI-TeaCacheHunyuanVideo), we’ve added support for the **TeaCache sampler**.
+
+- **How to Use:**
+  Replace the `samplercustomadvanced` node in the official workflow with the TeaCache sampler node. Adjust the acceleration rate as needed to start using it.
+  
+- **Performance:**
+  In testing with an NVIDIA 4090, rendering a 720×480 resolution video with 65 frames took only 55 seconds using a speedup factor of `x2.1`. This is approximately twice as fast as the original method.
+
+- **Caution:**
+  While the TeaCache sampler significantly accelerates processing, it may reduce image quality and dynamic effects. Use with discretion.
+
+- **Precision Support:**
+  Supports `bf16` and `fp8`.
+  
+![image](https://github.com/user-attachments/assets/9e890a64-7502-4e1f-8739-15748efc1768)
+
+
+https://github.com/user-attachments/assets/af06b9d3-9c84-4a83-ba90-eb4ec4bb2e99
+
+
 ---
 
 ## **Instructions**
